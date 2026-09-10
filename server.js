@@ -20,6 +20,23 @@ const BASE_URL =
 // Allow Express to read JSON request bodies.
 app.use(express.json());
 
+// Check API key before allowing protected operations.
+function requireApiKey(req, res, next) {
+  // Read the API key from the x-api-key request header.
+  const apiKey = req.headers["x-api-key"];
+
+  // Reject the request if the API key is missing or incorrect.
+  if (!apiKey || apiKey !== process.env.API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized",
+    });
+  }
+
+  // Continue to the requested route when the API key is valid.
+  next();
+}
+
 // Create PostgreSQL connection pool using Render's DATABASE_URL.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -76,6 +93,7 @@ function generateShortCode() {
 
   // Convert each random byte into an allowed character.
   for (let i = 0; i < 6; i++) {
+    // Add one secure random character to the code.
     code += chars[randomBytes[i] % chars.length];
   }
 
@@ -83,8 +101,9 @@ function generateShortCode() {
   return code;
 }
 
-// API endpoint used to convert a long URL into a short URL.
-app.post("/shorten", async (req, res) => {
+// Create a new short URL.
+// API key is required for this endpoint.
+app.post("/shorten", requireApiKey, async (req, res) => {
   try {
     // Read the long URL and optional expiration date from the request body.
     const { longUrl, expiresAt } = req.body;
@@ -150,7 +169,7 @@ app.post("/shorten", async (req, res) => {
 
     // Generate another code if a collision occurs.
     while (existingCode.rows.length > 0) {
-      // Generate a new candidate code.
+      // Generate a new candidate short code.
       shortCode = generateShortCode();
 
       // Check whether the new candidate already exists.
@@ -197,7 +216,8 @@ app.post("/shorten", async (req, res) => {
 });
 
 // Return information about one short URL.
-app.get("/info/:shortCode", async (req, res) => {
+// API key is required for this endpoint.
+app.get("/info/:shortCode", requireApiKey, async (req, res) => {
   try {
     // Read the requested short code.
     const { shortCode } = req.params;
@@ -244,12 +264,13 @@ app.get("/info/:shortCode", async (req, res) => {
 });
 
 // Disable an existing short URL.
-app.patch("/disable/:shortCode", async (req, res) => {
+// API key is required for this endpoint.
+app.patch("/disable/:shortCode", requireApiKey, async (req, res) => {
   try {
-    // Read the short code from the URL.
+    // Read the short code from the request path.
     const { shortCode } = req.params;
 
-    // Set the short URL status to inactive.
+    // Change the short URL status to inactive.
     const result = await pool.query(
       `
       UPDATE urls
@@ -268,17 +289,17 @@ app.patch("/disable/:shortCode", async (req, res) => {
       });
     }
 
-    // Return confirmation.
+    // Return successful disable response.
     res.json({
       success: true,
       message: "Short URL disabled",
       url: result.rows[0],
     });
   } catch (error) {
-    // Log unexpected errors.
+    // Show unexpected errors in server logs.
     console.error("Disable error:", error);
 
-    // Return generic error.
+    // Return a generic server error.
     res.status(500).json({
       success: false,
       message: "Internal server error",
@@ -287,12 +308,13 @@ app.patch("/disable/:shortCode", async (req, res) => {
 });
 
 // Enable an existing short URL.
-app.patch("/enable/:shortCode", async (req, res) => {
+// API key is required for this endpoint.
+app.patch("/enable/:shortCode", requireApiKey, async (req, res) => {
   try {
-    // Read the short code from the URL.
+    // Read the short code from the request path.
     const { shortCode } = req.params;
 
-    // Set the short URL status back to active.
+    // Change the short URL status back to active.
     const result = await pool.query(
       `
       UPDATE urls
@@ -311,30 +333,32 @@ app.patch("/enable/:shortCode", async (req, res) => {
       });
     }
 
-    // Return confirmation.
+    // Return successful enable response.
     res.json({
       success: true,
       message: "Short URL enabled",
       url: result.rows[0],
     });
   } catch (error) {
-    // Log unexpected errors.
+    // Show unexpected errors in server logs.
     console.error("Enable error:", error);
 
-    // Return generic error.
+    // Return a generic server error.
     res.status(500).json({
       success: false,
       message: "Internal server error",
     });
   }
 });
-// Endpoint called when someone opens one of our short links.
+
+// Public endpoint called when someone opens a short URL.
+// API key is NOT required here because users must be able to open the link.
 app.get("/:shortCode", async (req, res) => {
   try {
     // Read the short code from the URL path.
     const { shortCode } = req.params;
 
-    // Get the original URL and its current status from PostgreSQL.
+    // Get the original URL and current link status from PostgreSQL.
     const result = await pool.query(
       `
       SELECT
@@ -353,7 +377,7 @@ app.get("/:shortCode", async (req, res) => {
       return res.status(404).send("Short URL not found");
     }
 
-    // Get the database record.
+    // Read the matching database record.
     const record = result.rows[0];
 
     // Block links that have been manually disabled.
@@ -369,7 +393,7 @@ app.get("/:shortCode", async (req, res) => {
       return res.status(410).send("This short URL has expired");
     }
 
-    // Increase the click counter whenever the link is successfully opened.
+    // Increase the click counter whenever the short URL is successfully opened.
     await pool.query(
       `
       UPDATE urls
@@ -400,6 +424,6 @@ initializeDatabase()
     });
   })
   .catch((error) => {
-    // Show the database startup error if the connection fails.
+    // Show database startup errors if the connection fails.
     console.error("Database initialization failed:", error);
   });
