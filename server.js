@@ -243,6 +243,91 @@ app.get("/info/:shortCode", async (req, res) => {
   }
 });
 
+// Disable an existing short URL.
+app.patch("/disable/:shortCode", async (req, res) => {
+  try {
+    // Read the short code from the URL.
+    const { shortCode } = req.params;
+
+    // Set the short URL status to inactive.
+    const result = await pool.query(
+      `
+      UPDATE urls
+      SET is_active = FALSE
+      WHERE short_code = $1
+      RETURNING short_code, is_active
+      `,
+      [shortCode]
+    );
+
+    // Return 404 if the short code does not exist.
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Short URL not found",
+      });
+    }
+
+    // Return confirmation.
+    res.json({
+      success: true,
+      message: "Short URL disabled",
+      url: result.rows[0],
+    });
+  } catch (error) {
+    // Log unexpected errors.
+    console.error("Disable error:", error);
+
+    // Return generic error.
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+});
+
+// Enable an existing short URL.
+app.patch("/enable/:shortCode", async (req, res) => {
+  try {
+    // Read the short code from the URL.
+    const { shortCode } = req.params;
+
+    // Set the short URL status back to active.
+    const result = await pool.query(
+      `
+      UPDATE urls
+      SET is_active = TRUE
+      WHERE short_code = $1
+      RETURNING short_code, is_active
+      `,
+      [shortCode]
+    );
+
+    // Return 404 if the short code does not exist.
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Short URL not found",
+      });
+    }
+
+    // Return confirmation.
+    res.json({
+      success: true,
+      message: "Short URL enabled",
+      url: result.rows[0],
+    });
+  } catch (error) {
+    // Log unexpected errors.
+    console.error("Enable error:", error);
+
+    // Return generic error.
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+});
 // Endpoint called when someone opens one of our short links.
 app.get("/:shortCode", async (req, res) => {
   try {
