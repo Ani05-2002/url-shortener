@@ -4,6 +4,9 @@ const express = require("express");
 // Import PostgreSQL connection pool.
 const { Pool } = require("pg");
 
+// Import Node's crypto module for secure random values.
+const crypto = require("crypto");
+
 // Create the Express application.
 const app = express();
 
@@ -39,19 +42,24 @@ async function initializeDatabase() {
   console.log("PostgreSQL database initialized");
 }
 
-// Generate a random 6-character short code.
+// Import Node's crypto module for stronger random code generation.
+const crypto = require("crypto");
+
+// Generate a secure random 6-character short code.
 function generateShortCode() {
-  // Characters allowed inside our generated short codes.
+  // Characters allowed inside short codes.
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-  // Start with an empty short code.
+  // Generate six secure random bytes.
+  const randomBytes = crypto.randomBytes(6);
+
+  // Start with an empty code.
   let code = "";
 
-  // Generate exactly six random characters.
+  // Convert each random byte into one allowed character.
   for (let i = 0; i < 6; i++) {
-    // Select one random character and append it to the code.
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
+    code += chars[randomBytes[i] % chars.length];
   }
 
   // Return the generated short code.
