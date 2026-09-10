@@ -1,29 +1,43 @@
 // Import Express to create our HTTP server.
 const express = require("express");
 
-// Import SQLite so URL mappings can be stored permanently.
-const Database = require("better-sqlite3");
+// Import PostgreSQL connection pool.
+const { Pool } = require("pg");
 
 // Create the Express application.
 const app = express();
 
 // Use Render's assigned port in production, or 3000 locally.
 const PORT = process.env.PORT || 3000;
+
+// Use Render's public URL in production, or localhost during local development.
+const BASE_URL =
+  process.env.BASE_URL || `http://localhost:${PORT}`;
+
 // Allow Express to read JSON request bodies.
 app.use(express.json());
 
-// Create or open the local SQLite database file.
-const db = new Database("urls.db");
+// Create PostgreSQL connection pool using Render's DATABASE_URL.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: false,
+});
 
 // Create the URLs table if it does not already exist.
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS urls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    short_code TEXT UNIQUE NOT NULL,
-    long_url TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`).run();
+async function initializeDatabase() {
+  // Create our main URL mapping table.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS urls (
+      id SERIAL PRIMARY KEY,
+      short_code VARCHAR(20) UNIQUE NOT NULL,
+      long_url TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Confirm database initialization in Render logs.
+  console.log("PostgreSQL database initialized");
+}
 
 // Generate a random 6-character short code.
 function generateShortCode() {
@@ -45,108 +59,132 @@ function generateShortCode() {
 }
 
 // API endpoint used to convert a long URL into a short URL.
-app.post("/shorten", (req, res) => {
-  // Read the long URL from the JSON request body.
-  const { longUrl } = req.body;
-
-  // Check whether the user supplied a URL.
-  if (!longUrl) {
-    return res.status(400).json({
-      success: false,
-      message: "longUrl is required",
-    });
-  }
-
-  // Validate the supplied URL.
+app.post("/shorten", async (req, res) => {
   try {
-    // Parse the supplied URL.
-    const parsedUrl = new URL(longUrl);
+    // Read the long URL from the JSON request body.
+    const { longUrl } = req.body;
 
-    // Allow only normal HTTP and HTTPS URLs.
-    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    // Check whether the user supplied a URL.
+    if (!longUrl) {
       return res.status(400).json({
         success: false,
-        message: "Only http and https URLs are allowed",
+        message: "longUrl is required",
       });
     }
+
+    // Validate the supplied URL.
+    try {
+      // Parse the supplied URL.
+      const parsedUrl = new URL(longUrl);
+
+      // Allow only normal HTTP and HTTPS URLs.
+      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+        return res.status(400).json({
+          success: false,
+          message: "Only http and https URLs are allowed",
+        });
+      }
+    } catch (error) {
+      // Return an error when the supplied value is not a valid URL.
+      return res.status(400).json({
+        success: false,
+        message: "Invalid URL",
+      });
+    }
+
+    // Generate the first candidate short code.
+    let shortCode = generateShortCode();
+
+    // Check whether the generated short code already exists in PostgreSQL.
+    let existingCode = await pool.query(
+      "SELECT id FROM urls WHERE short_code = $1",
+      [shortCode]
+    );
+
+    // Generate another code if a collision occurs.
+    while (existingCode.rows.length > 0) {
+      // Generate a new candidate code.
+      shortCode = generateShortCode();
+
+      // Check whether the new candidate already exists.
+      existingCode = await pool.query(
+        "SELECT id FROM urls WHERE short_code = $1",
+        [shortCode]
+      );
+    }
+
+    // Insert the short-code-to-long-URL mapping into PostgreSQL.
+    await pool.query(
+      `
+      INSERT INTO urls (short_code, long_url)
+      VALUES ($1, $2)
+      `,
+      [shortCode, longUrl]
+    );
+
+    // Build the short URL using Render's public BASE_URL.
+    const shortUrl = `${BASE_URL}/${shortCode}`;
+
+    // Return information about the newly generated short URL.
+    res.status(201).json({
+      success: true,
+      longUrl,
+      shortCode,
+      shortUrl,
+    });
   } catch (error) {
-    // Return an error when the supplied value is not a valid URL.
-    return res.status(400).json({
+    // Show unexpected errors in Render/server logs.
+    console.error("Shorten error:", error);
+
+    // Return a generic server error.
+    res.status(500).json({
       success: false,
-      message: "Invalid URL",
+      message: "Internal server error",
     });
   }
-
-  // Generate the first candidate short code.
-  let shortCode = generateShortCode();
-
-  // Look for an existing database record using this code.
-  let existingCode = db
-    .prepare("SELECT id FROM urls WHERE short_code = ?")
-    .get(shortCode);
-
-  // Generate another code if a collision occurs.
-  while (existingCode) {
-    // Generate a new candidate code.
-    shortCode = generateShortCode();
-
-    // Check whether the new candidate already exists.
-    existingCode = db
-      .prepare("SELECT id FROM urls WHERE short_code = ?")
-      .get(shortCode);
-  }
-
-  // Insert the short-code-to-long-URL mapping into SQLite.
-  db.prepare(
-    `
-    INSERT INTO urls (short_code, long_url)
-    VALUES (?, ?)
-    `
-  ).run(shortCode, longUrl);
-
- // Use Render's public URL in production and localhost during local development.
-const BASE_URL =
-  process.env.BASE_URL || `http://localhost:${PORT}`;
-
-// Build the short URL using the selected base URL.
-const shortUrl = `${BASE_URL}/${shortCode}`;
-
-  // Return information about the newly generated short URL.
-  res.status(201).json({
-    success: true,
-    longUrl,
-    shortCode,
-    shortUrl,
-  });
 });
 
 // Endpoint called when someone opens one of our short links.
-app.get("/:shortCode", (req, res) => {
-  // Read the short code from the URL path.
-  const { shortCode } = req.params;
+app.get("/:shortCode", async (req, res) => {
+  try {
+    // Read the short code from the URL path.
+    const { shortCode } = req.params;
 
-  // Search SQLite for the corresponding long URL.
-  const record = db
-    .prepare(
-      `
-      SELECT long_url
-      FROM urls
-      WHERE short_code = ?
-      `
-    )
-    .get(shortCode);
+    // Search PostgreSQL for the corresponding long URL.
+    const result = await pool.query(
+      "SELECT long_url FROM urls WHERE short_code = $1",
+      [shortCode]
+    );
 
-  // Return 404 if that short code does not exist.
-  if (!record) {
-    return res.status(404).send("Short URL not found");
+    // Return 404 if that short code does not exist.
+    if (result.rows.length === 0) {
+      return res.status(404).send("Short URL not found");
+    }
+
+    // Read the original URL from the PostgreSQL result.
+    const longUrl = result.rows[0].long_url;
+
+    // Redirect the browser to the stored original URL.
+    res.redirect(302, longUrl);
+  } catch (error) {
+    // Show unexpected redirect errors in server logs.
+    console.error("Redirect error:", error);
+
+    // Return a generic server error.
+    res.status(500).send("Internal server error");
   }
-
-  // Redirect the browser to the stored original URL.
-  res.redirect(302, record.long_url);
 });
 
-// Listen on all network interfaces so the app works on public hosting.
-app.listen(PORT, "0.0.0.0", () => {
-  // Show the running port in the server logs.
-  console.log(`URL Shortener running on port ${PORT}`);
-});
+// Initialize PostgreSQL before starting the Express server.
+initializeDatabase()
+  .then(() => {
+    // Start the server only after the database connection is successful.
+    app.listen(PORT, "0.0.0.0", () => {
+      // Show the running port in Render/server logs.
+      console.log(`URL Shortener running on port ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    // Show the database startup error if connection fails.
+    console.error("Database initialization failed:", error);
+  });
