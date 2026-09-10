@@ -1,10 +1,13 @@
-// Import Express to create our HTTP server.
+// Import Express to create the HTTP server.
 const express = require("express");
+
+// Import rate limiter to protect APIs from excessive requests.
+const rateLimit = require("express-rate-limit");
 
 // Import PostgreSQL connection pool.
 const { Pool } = require("pg");
 
-// Import Node's crypto module for stronger random short-code generation.
+// Import Node's crypto module for secure short-code generation.
 const crypto = require("crypto");
 
 // Create the Express application.
@@ -13,16 +16,25 @@ const app = express();
 // Use Render's assigned port in production, or 3000 locally.
 const PORT = process.env.PORT || 3000;
 
-// Use Render's public URL in production, or localhost during local development.
+// Use Render's public URL in production, or localhost locally.
 const BASE_URL =
   process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // Allow Express to read JSON request bodies.
 app.use(express.json());
 
-// Check API key before allowing protected operations.
+// Create a PostgreSQL connection pool using Render's DATABASE_URL.
+const pool = new Pool({
+  // Connect using the database URL stored in Render environment variables.
+  connectionString: process.env.DATABASE_URL,
+
+  // Render internal PostgreSQL connection works without custom SSL configuration.
+  ssl: false,
+});
+
+// Protect admin APIs using an API key.
 function requireApiKey(req, res, next) {
-  // Read the API key from the x-api-key request header.
+  // Read the API key sent in the request header.
   const apiKey = req.headers["x-api-key"];
 
   // Reject the request if the API key is missing or incorrect.
@@ -33,21 +45,36 @@ function requireApiKey(req, res, next) {
     });
   }
 
-  // Continue to the requested route when the API key is valid.
+  // Continue to the requested API when the key is correct.
   next();
 }
 
-// Create PostgreSQL connection pool using Render's DATABASE_URL.
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+// Limit how often one IP address can create short URLs.
+const shortenLimiter = rateLimit({
+  // Count requests inside a 1-minute window.
+  windowMs: 60 * 1000,
 
-  // Internal Render PostgreSQL connection does not require custom SSL handling.
-  ssl: false,
+  // Allow only 5 requests per IP during that minute.
+  limit: 5,
+
+  // Return modern RateLimit headers.
+  standardHeaders: true,
+
+  // Disable old X-RateLimit headers.
+  legacyHeaders: false,
+
+  // Return a custom response after exceeding the limit.
+  handler: (req, res) => {
+    return res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again later.",
+    });
+  },
 });
 
-// Create/update the URLs table when the application starts.
+// Create/update the database table when the application starts.
 async function initializeDatabase() {
-  // Create the basic table if this is the first deployment.
+  // Create the URLs table if it does not already exist.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS urls (
       id SERIAL PRIMARY KEY,
@@ -57,7 +84,7 @@ async function initializeDatabase() {
     )
   `);
 
-  // Add expiration support to existing databases.
+  // Add expiration support if the column does not already exist.
   await pool.query(`
     ALTER TABLE urls
     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP
@@ -69,160 +96,165 @@ async function initializeDatabase() {
     ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE
   `);
 
-  // Add click-count tracking.
+  // Add click tracking.
   await pool.query(`
     ALTER TABLE urls
     ADD COLUMN IF NOT EXISTS click_count INTEGER DEFAULT 0
   `);
 
-  // Confirm database initialization in server logs.
+  // Show confirmation in Render logs.
   console.log("PostgreSQL database initialized");
 }
 
-// Generate a secure random 6-character short code.
+// Generate a secure random short code.
 function generateShortCode() {
-  // Characters allowed inside our short codes.
+  // Characters allowed in our short URL code.
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-  // Generate secure random bytes.
-  const randomBytes = crypto.randomBytes(6);
-
-  // Start with an empty short code.
+  // Start with an empty code.
   let code = "";
 
-  // Convert each random byte into an allowed character.
+  // Generate 6 secure random characters.
   for (let i = 0; i < 6; i++) {
-    // Add one secure random character to the code.
-    code += chars[randomBytes[i] % chars.length];
+    // Generate a secure random number between 0 and 61.
+    const randomIndex = crypto.randomInt(chars.length);
+
+    // Add the selected character to the short code.
+    code += chars[randomIndex];
   }
 
-  // Return the generated short code.
+  // Return the completed short code.
   return code;
 }
 
 // Create a new short URL.
-// API key is required for this endpoint.
-app.post("/shorten", requireApiKey, async (req, res) => {
-  try {
-    // Read the long URL and optional expiration date from the request body.
-    const { longUrl, expiresAt } = req.body;
-
-    // Check whether the user supplied a URL.
-    if (!longUrl) {
-      return res.status(400).json({
-        success: false,
-        message: "longUrl is required",
-      });
-    }
-
-    // Validate the supplied URL.
+// Rate limiting and API-key authentication are required.
+app.post(
+  "/shorten",
+  shortenLimiter,
+  requireApiKey,
+  async (req, res) => {
     try {
-      // Parse the supplied URL.
-      const parsedUrl = new URL(longUrl);
+      // Read the long URL and optional expiration date from the request body.
+      const { longUrl, expiresAt } = req.body;
 
-      // Allow only HTTP and HTTPS URLs.
-      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      // Reject the request if longUrl is missing.
+      if (!longUrl) {
         return res.status(400).json({
           success: false,
-          message: "Only http and https URLs are allowed",
-        });
-      }
-    } catch (error) {
-      // Return an error when the supplied value is not a valid URL.
-      return res.status(400).json({
-        success: false,
-        message: "Invalid URL",
-      });
-    }
-
-    // Validate expiresAt if the user supplied one.
-    if (expiresAt) {
-      // Convert supplied expiration value into a JavaScript Date.
-      const expirationDate = new Date(expiresAt);
-
-      // Reject invalid date values.
-      if (Number.isNaN(expirationDate.getTime())) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid expiresAt date",
+          message: "longUrl is required",
         });
       }
 
-      // Reject expiration dates that are already in the past.
-      if (expirationDate <= new Date()) {
+      // Validate the supplied URL.
+      try {
+        // Convert the supplied string into a URL object.
+        const parsedUrl = new URL(longUrl);
+
+        // Only allow HTTP and HTTPS URLs.
+        if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+          return res.status(400).json({
+            success: false,
+            message: "Only http and https URLs are allowed",
+          });
+        }
+      } catch (error) {
+        // Reject invalid URL strings.
         return res.status(400).json({
           success: false,
-          message: "expiresAt must be a future date",
+          message: "Invalid URL",
         });
       }
-    }
 
-    // Generate the first candidate short code.
-    let shortCode = generateShortCode();
+      // Validate the expiration date if one was provided.
+      if (expiresAt) {
+        // Convert the provided expiration value into a Date.
+        const expirationDate = new Date(expiresAt);
 
-    // Check whether the generated short code already exists in PostgreSQL.
-    let existingCode = await pool.query(
-      "SELECT id FROM urls WHERE short_code = $1",
-      [shortCode]
-    );
+        // Reject an invalid date.
+        if (Number.isNaN(expirationDate.getTime())) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid expiresAt date",
+          });
+        }
 
-    // Generate another code if a collision occurs.
-    while (existingCode.rows.length > 0) {
-      // Generate a new candidate short code.
-      shortCode = generateShortCode();
+        // Reject an expiration date that is already in the past.
+        if (expirationDate <= new Date()) {
+          return res.status(400).json({
+            success: false,
+            message: "expiresAt must be a future date",
+          });
+        }
+      }
 
-      // Check whether the new candidate already exists.
-      existingCode = await pool.query(
+      // Generate the first candidate short code.
+      let shortCode = generateShortCode();
+
+      // Check whether that short code already exists.
+      let existingCode = await pool.query(
         "SELECT id FROM urls WHERE short_code = $1",
         [shortCode]
       );
+
+      // Keep generating until a unique code is found.
+      while (existingCode.rows.length > 0) {
+        // Generate another short code.
+        shortCode = generateShortCode();
+
+        // Check the new code again.
+        existingCode = await pool.query(
+          "SELECT id FROM urls WHERE short_code = $1",
+          [shortCode]
+        );
+      }
+
+      // Store the short-code mapping in PostgreSQL.
+      await pool.query(
+        `
+        INSERT INTO urls (
+          short_code,
+          long_url,
+          expires_at
+        )
+        VALUES ($1, $2, $3)
+        `,
+        [shortCode, longUrl, expiresAt || null]
+      );
+
+      // Build the complete public short URL.
+      const shortUrl = `${BASE_URL}/${shortCode}`;
+
+      // Return the newly created short URL.
+      return res.status(201).json({
+        success: true,
+        longUrl,
+        shortCode,
+        shortUrl,
+        expiresAt: expiresAt || null,
+      });
+    } catch (error) {
+      // Log unexpected shortening errors.
+      console.error("Shorten error:", error);
+
+      // Return a generic server error.
+      return res.status(500).json({
+        success: false,
+        message: "Internal server error",
+      });
     }
-
-    // Store the URL mapping and optional expiration date in PostgreSQL.
-    await pool.query(
-      `
-      INSERT INTO urls (
-        short_code,
-        long_url,
-        expires_at
-      )
-      VALUES ($1, $2, $3)
-      `,
-      [shortCode, longUrl, expiresAt || null]
-    );
-
-    // Build the public short URL.
-    const shortUrl = `${BASE_URL}/${shortCode}`;
-
-    // Return information about the newly generated short URL.
-    res.status(201).json({
-      success: true,
-      longUrl,
-      shortCode,
-      shortUrl,
-      expiresAt: expiresAt || null,
-    });
-  } catch (error) {
-    // Show unexpected errors in server logs.
-    console.error("Shorten error:", error);
-
-    // Return a generic server error.
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
   }
-});
+);
 
-// Return information about one short URL.
-// API key is required for this endpoint.
+// Get information about a short URL.
+// API key is required because this is an admin endpoint.
 app.get("/info/:shortCode", requireApiKey, async (req, res) => {
   try {
-    // Read the requested short code.
+    // Read the short code from the request path.
     const { shortCode } = req.params;
 
-    // Get URL information from PostgreSQL.
+    // Find the matching URL record.
     const result = await pool.query(
       `
       SELECT
@@ -238,7 +270,7 @@ app.get("/info/:shortCode", requireApiKey, async (req, res) => {
       [shortCode]
     );
 
-    // Return 404 if the short code does not exist.
+    // Return 404 if the code does not exist.
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
@@ -246,17 +278,17 @@ app.get("/info/:shortCode", requireApiKey, async (req, res) => {
       });
     }
 
-    // Return stored URL information.
-    res.json({
+    // Return the URL information.
+    return res.json({
       success: true,
       url: result.rows[0],
     });
   } catch (error) {
-    // Show unexpected errors in server logs.
+    // Log unexpected errors.
     console.error("Info error:", error);
 
-    // Return a generic server error.
-    res.status(500).json({
+    // Return a generic error.
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });
@@ -264,13 +296,13 @@ app.get("/info/:shortCode", requireApiKey, async (req, res) => {
 });
 
 // Disable an existing short URL.
-// API key is required for this endpoint.
+// API key is required because this is an admin operation.
 app.patch("/disable/:shortCode", requireApiKey, async (req, res) => {
   try {
-    // Read the short code from the request path.
+    // Read the short code from the URL.
     const { shortCode } = req.params;
 
-    // Change the short URL status to inactive.
+    // Set the matching URL to inactive.
     const result = await pool.query(
       `
       UPDATE urls
@@ -281,7 +313,7 @@ app.patch("/disable/:shortCode", requireApiKey, async (req, res) => {
       [shortCode]
     );
 
-    // Return 404 if the short code does not exist.
+    // Return 404 if the URL does not exist.
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
@@ -289,18 +321,18 @@ app.patch("/disable/:shortCode", requireApiKey, async (req, res) => {
       });
     }
 
-    // Return successful disable response.
-    res.json({
+    // Return confirmation.
+    return res.json({
       success: true,
       message: "Short URL disabled",
       url: result.rows[0],
     });
   } catch (error) {
-    // Show unexpected errors in server logs.
+    // Log unexpected errors.
     console.error("Disable error:", error);
 
-    // Return a generic server error.
-    res.status(500).json({
+    // Return a generic error.
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });
@@ -308,13 +340,13 @@ app.patch("/disable/:shortCode", requireApiKey, async (req, res) => {
 });
 
 // Enable an existing short URL.
-// API key is required for this endpoint.
+// API key is required because this is an admin operation.
 app.patch("/enable/:shortCode", requireApiKey, async (req, res) => {
   try {
-    // Read the short code from the request path.
+    // Read the short code from the URL.
     const { shortCode } = req.params;
 
-    // Change the short URL status back to active.
+    // Set the matching URL back to active.
     const result = await pool.query(
       `
       UPDATE urls
@@ -325,7 +357,7 @@ app.patch("/enable/:shortCode", requireApiKey, async (req, res) => {
       [shortCode]
     );
 
-    // Return 404 if the short code does not exist.
+    // Return 404 if the URL does not exist.
     if (result.rows.length === 0) {
       return res.status(404).json({
         success: false,
@@ -333,32 +365,32 @@ app.patch("/enable/:shortCode", requireApiKey, async (req, res) => {
       });
     }
 
-    // Return successful enable response.
-    res.json({
+    // Return confirmation.
+    return res.json({
       success: true,
       message: "Short URL enabled",
       url: result.rows[0],
     });
   } catch (error) {
-    // Show unexpected errors in server logs.
+    // Log unexpected errors.
     console.error("Enable error:", error);
 
-    // Return a generic server error.
-    res.status(500).json({
+    // Return a generic error.
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });
   }
 });
 
-// Public endpoint called when someone opens a short URL.
-// API key is NOT required here because users must be able to open the link.
+// Public redirect endpoint.
+// No API key is required because users must be able to open short links.
 app.get("/:shortCode", async (req, res) => {
   try {
-    // Read the short code from the URL path.
+    // Read the short code from the URL.
     const { shortCode } = req.params;
 
-    // Get the original URL and current link status from PostgreSQL.
+    // Find the original URL and its status.
     const result = await pool.query(
       `
       SELECT
@@ -372,28 +404,32 @@ app.get("/:shortCode", async (req, res) => {
       [shortCode]
     );
 
-    // Return 404 if that short code does not exist.
+    // Return 404 if no matching code exists.
     if (result.rows.length === 0) {
       return res.status(404).send("Short URL not found");
     }
 
-    // Read the matching database record.
+    // Read the database record.
     const record = result.rows[0];
 
-    // Block links that have been manually disabled.
+    // Stop redirecting if the URL was manually disabled.
     if (!record.is_active) {
-      return res.status(410).send("This short URL has been disabled");
+      return res.status(410).send(
+        "This short URL has been disabled"
+      );
     }
 
-    // Block links that have passed their expiration date.
+    // Stop redirecting if the URL has expired.
     if (
       record.expires_at &&
       new Date(record.expires_at) < new Date()
     ) {
-      return res.status(410).send("This short URL has expired");
+      return res.status(410).send(
+        "This short URL has expired"
+      );
     }
 
-    // Increase the click counter whenever the short URL is successfully opened.
+    // Increase the click count by one.
     await pool.query(
       `
       UPDATE urls
@@ -403,27 +439,32 @@ app.get("/:shortCode", async (req, res) => {
       [shortCode]
     );
 
-    // Redirect the browser to the stored original URL.
-    res.redirect(302, record.long_url);
+    // Redirect the user to the original URL.
+    return res.redirect(302, record.long_url);
   } catch (error) {
-    // Show unexpected redirect errors in server logs.
+    // Log unexpected redirect errors.
     console.error("Redirect error:", error);
 
     // Return a generic server error.
-    res.status(500).send("Internal server error");
+    return res.status(500).send("Internal server error");
   }
 });
 
-// Initialize PostgreSQL before starting the Express server.
+// Initialize the database before starting the server.
 initializeDatabase()
   .then(() => {
-    // Start the server only after the database connection is successful.
+    // Start the Express server after PostgreSQL is ready.
     app.listen(PORT, "0.0.0.0", () => {
-      // Show the running port in Render logs.
-      console.log(`URL Shortener running on port ${PORT}`);
+      // Show the active port in Render logs.
+      console.log(
+        `URL Shortener running on port ${PORT}`
+      );
     });
   })
   .catch((error) => {
-    // Show database startup errors if the connection fails.
-    console.error("Database initialization failed:", error);
+    // Log startup errors if PostgreSQL initialization fails.
+    console.error(
+      "Database initialization failed:",
+      error
+    );
   });
