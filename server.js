@@ -1,5 +1,8 @@
 // Import Express to create the HTTP server.
 const express = require("express");
+// Import CORS so our frontend can communicate with the backend.
+
+const cors = require("cors");
 
 // Import rate limiter to protect APIs from excessive requests.
 const rateLimit = require("express-rate-limit");
@@ -22,6 +25,8 @@ const BASE_URL =
 
 // Allow Express to read JSON request bodies.
 app.use(express.json());
+// Allow our React frontend to call the API during R&D.
+app.use(cors());
 
 // Create a PostgreSQL connection pool using Render's DATABASE_URL.
 const pool = new Pool({
