@@ -1,0 +1,5 @@
+# Don't upload installed npm packages to GitHub.
+node_modules/
+
+# Don't upload our local SQLite database.
+urls.db
