@@ -104,8 +104,12 @@ app.post("/shorten", (req, res) => {
     `
   ).run(shortCode, longUrl);
 
-  // Build the localhost version of our short URL.
-  const shortUrl = `http://localhost:${PORT}/${shortCode}`;
+ // Use Render's public URL in production and localhost during local development.
+const BASE_URL =
+  process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// Build the short URL using the selected base URL.
+const shortUrl = `${BASE_URL}/${shortCode}`;
 
   // Return information about the newly generated short URL.
   res.status(201).json({
