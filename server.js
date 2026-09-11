@@ -473,3 +473,7 @@ initializeDatabase()
       error
     );
   });
+
+
+
+  //Added this 
